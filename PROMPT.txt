@@ -1,0 +1,47 @@
+我们业务上有几个服务共享一份配置，目前的方案是写一个公共库让各服务自己加载，但这样配置更新要重新发版很麻烦。想搞个独立的配置同步服务，配置改完之后主动推给订阅者，类似一个简化版的 Apollo / Nacos。
+
+Go + Gin 写，数据存内存 + 定期 dump 到 ./data/dump.json 做持久化（每 30 秒 dump 一次），重启自动加载就行。
+
+核心实体两个，ConfigKey 和 Subscription。ConfigKey 有 key_path、value（json.RawMessage 任何 JSON 值都行）、version（自增整数）、updated_at（RFC3339）、updated_by、tenant_id。Subscription 有 subscriber_id、key_pattern、callback_url、created_at、tenant_id、active（bool）、status（healthy/unhealthy，初始 healthy）、last_notify_at、last_error。
+
+租户隔离是必须的。每个 API 请求都得带 X-Tenant-Id header，没带就 401。某个租户只能看自己租户的 config 和自己的 subscription，跨租户访问返回 403。租户下的用户用 X-User-Id header 标识。
+
+配置变更的核心流程是这样。客户端 PUT /api/configs/{key_path} 更新一个 key，请求体里 value 字段，服务端把 version +1，记录 updated_at 和 updated_by（updated_by 从 X-User-Id header 取，没有就 anonymous）。然后查找所有匹配这个 key_pattern 的 subscription（key_pattern 支持通配符比如 db.* 匹配 db.host、db.port 这种，* 匹配任意段，** 匹配多段），向它们的 callback_url 发 POST 通知，POST body 是 {key_path, value, version, updated_at, tenant_id, event: "updated"}。
+
+通知是异步的，开一个 goroutine 池处理（默认 16 个 worker），通知结果要重试 3 次（间隔 1s、5s、30s），3 次都失败就把这个 subscription 标记为 unhealthy 但保留订阅关系（不删掉），运维可以查 GET /api/subscriptions/{id} 看到 status 字段。unhealthy 之后这个 subscription 暂时不再接收通知，恢复方式：手动 POST /api/subscriptions/{id}/recover 重置为 healthy，或者下一次通知成功就自动恢复。
+
+冲突解决。多个客户端同时改同一个 key（version 并发竞争）走最后写入胜，version 取 max(当前+1, 客户端带过来的 version)，客户端可以 PUT 的时候带 If-Match: version=N 表示"只有当前版本是 N 才更新"，不匹配返回 412 Precondition Failed。If-Match 不匹配的时候响应体里带上当前 version 方便客户端做 merge。
+
+手动选择版本也有个入口 POST /api/configs/{key_path}/resolve 传两个 candidate_version 和一个 resolution（pick_old / pick_new）让管理员选一个。回滚接口 POST /api/configs/{key_path}/rollback --to <version> 直接回到历史某个版本。
+
+配置读取 GET /api/configs/{key_path} 看单条（支持 ?version=N 看历史版本），GET /api/configs?prefix=db. 列出某个前缀下所有。配置历史 GET /api/configs/{key_path}/history 看最近 20 个版本（version、updated_at、updated_by、value）。订阅接口 POST /api/subscriptions 创建、DELETE /api/subscriptions/{id} 取消、GET /api/subscriptions 列出当前租户所有。
+
+多节点同步这个事未来要做的，目前单节点跑通就行。代码里预留一个 Notifier 接口，本地内存实现是 LocalNotifier，注释里写一下以后可以加 RemoteNotifier 做节点间同步。
+
+代码分文件，handlers/configs.go、handlers/subscriptions.go、services/notifier.go、storage/store.go、models/models.go、middleware/auth.go 这种结构。auth middleware 解析 X-Tenant-Id 和 X-User-Id 注入到 context。
+
+依赖就 gin 加个 uuid 库，剩下标准库够用。启动后监听 9000 端口，打印加载的 config 数量。
+
+配置灰度发布这个事。POST /api/configs/{key_path}/gray 创建灰度版本，body 里 value、gray_rules（匹配条件，比如 user_id % 100 < 10 表示 10% 用户先用新值），GET /api/configs/{key_path}/gray 查灰度规则。客户端 GET /api/configs/{key_path} 的时候如果带 X-Gray-User-Id header 就根据 gray_rules 决定返回哪个版本（base 或 gray）。灰度全量切换到正式版用 POST /api/configs/{key_path}/promote 把 gray 合并到 base。
+
+配置变更审计。GET /api/audit?key_path=db.host 看一个 key 的所有变更历史，包括谁、什么时间、改成什么值、回滚记录。审计日志写一个独立文件 ./data/audit.jsonl 不参与主存储的 dump。
+
+配置预览。POST /api/configs/preview 传一组 key/value 变更，服务端返回一个 diff（哪些 key 会变、哪些订阅者会收到通知、影响范围），让管理员在真正 PUT 之前先确认影响。
+
+批量操作。POST /api/configs/batch 一次性改多个 key，全成功全失败（不部分成功），事务语义。批量操作的审计日志记一次。
+
+长轮询支持。GET /api/configs/{key_path}?long_poll=true&timeout=30 服务端 hold 这个请求 30 秒，期间 key 变化就立即返回，30 秒没变化就返回当前值。减少客户端轮询。
+
+Notion 风格的元数据。每个 key 可以挂一些 metadata：description、owner（X-User-Id）、tags、deprecated_at（标记为弃用的时间）、replacement（替代 key 的路径）。弃用后的 key 不能 PUT 只能 GET（避免误操作），GET 时响应里加 Deprecation header 和 Sunset header。
+
+健康检查。GET /healthz 返回 200 加服务版本、启动时间、内存里 key 数量、订阅数量。GET /readyz 校验依赖（文件存储可读可写）后返回 200。
+
+权限模型。三个角色 viewer（只读）、editor（可改）、admin（可改 + 管理订阅）。用 X-User-Role header 传角色，admin 角色还需要 X-Admin-Token 校验。
+
+配置导入导出。GET /api/admin/export 把所有配置导出成 JSON（方便备份），POST /api/admin/import 从 JSON 导入，导入冲突的 key 默认 skip 也可选 overwrite。
+
+优雅退出。收到 SIGTERM 时先停止接收新请求、等待进行中的通知完成（最多 30 秒）、刷盘内存数据、再退出。
+
+整个项目 go mod tidy 通过、go vet 通过、go test 至少 60% 覆盖率。Makefile 里有 build / run / test / lint 几个 target。Dockerfile 多阶段构建最终镜像 < 30MB。
+
+代码组织。cmd/configsync/main.go 入口，internal/config/ 放业务逻辑，internal/storage/ 放持久化，internal/notifier/ 放订阅通知，internal/auth/ 放权限，internal/api/ 放 handler。

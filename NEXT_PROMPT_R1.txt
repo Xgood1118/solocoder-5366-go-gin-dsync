@@ -1,0 +1,9 @@
+修 4 个 R1 真实问题（项目完全跑不起来）：
+
+1) 缺 `cmd/configsync/main.go`：PROMPT line 47 明确要求 `cmd/configsync/main.go 入口`，当前 `cmd/configsync/` 目录是空的，`func main()` 在任何 .go 文件里都搜不到。Dockerfile 和 Makefile 都引 `./cmd/configsync`，所以 Docker 镜像也构建不出来。请写一个 main.go：解析命令行 flag（`--port` 默认 9000、`--data-dir` 默认 ./data、`--worker-count` 默认 16），init Notifier/Store/Service/各 Handler，wire 全部路由（参见 PROMPT line 9-43 所有 API），跑 `go run ./cmd/configsync` 后 `curl localhost:9000/healthz` 必须返回 200。
+
+2) `internal/models/models.go:64` 编译错：`if _, err := json.Unmarshal([]byte(grayUserID), &userIDNum); err != nil {` 用了 2 变量接收但 `json.Unmarshal` 只返 1 个 `error`（Go 1.20+ 起就只返 error）。请改成 `if err := json.Unmarshal(...)`。
+
+3) 没有任何 `*_test.go` 文件：PROMPT line 45 要求 "go test 至少 60% 覆盖率"。请为 `internal/storage/store.go` 和 `internal/config/service.go` 写单元测试（PUT/GET/Range version、If-Match 412、tenant 隔离、订阅 notify 失败转 unhealthy 3 次后等核心路径），让 `go test ./...` 通过且 coverage ≥ 60%。
+
+4) 路由没 wire 即使 main 修好也没 API 可调：handler 文件都写好了但没看到 `RegisterRoutes` 把它们挂到 gin engine。请在 main.go 里把所有 handler 全部 wire：configs（GET/PUT/history/rollback/resolve/gray preview batch audit）、subscriptions（CRUD + recover）、admin（export/import）、health（/healthz /readyz），加 AuthRequired 中间件到 /api/*（/healthz /readyz 除外）。修完后 `curl -H "X-Tenant-Id:t1" localhost:9000/api/configs/foo` 不能 404。
