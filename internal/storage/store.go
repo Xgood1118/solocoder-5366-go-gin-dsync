@@ -212,11 +212,19 @@ func (s *Store) GetHistory(tenantID, keyPath string) []models.ConfigVersion {
 
 	if tenant, ok := s.configs[tenantID]; ok {
 		if cfg, ok := tenant[keyPath]; ok {
-			history := make([]models.ConfigVersion, len(cfg.History))
-			copy(history, cfg.History)
-			for i, j := 0, len(history)-1; i < j; i, j = i+1, j-1 {
-				history[i], history[j] = history[j], history[i]
+			history := make([]models.ConfigVersion, 0, len(cfg.History)+1)
+			history = append(history, models.ConfigVersion{
+				Version:   cfg.Version,
+				Value:     cfg.Value,
+				UpdatedAt: cfg.UpdatedAt,
+				UpdatedBy: cfg.UpdatedBy,
+			})
+			hist := make([]models.ConfigVersion, len(cfg.History))
+			copy(hist, cfg.History)
+			for i, j := 0, len(hist)-1; i < j; i, j = i+1, j-1 {
+				hist[i], hist[j] = hist[j], hist[i]
 			}
+			history = append(history, hist...)
 			return history
 		}
 	}
@@ -267,18 +275,11 @@ func (s *Store) PutConfig(tenantID, keyPath string, value json.RawMessage, updat
 			UpdatedAt: cfg.UpdatedAt,
 			UpdatedBy: cfg.UpdatedBy,
 		})
-		if len(newCfg.History) > s.maxHistory {
-			newCfg.History = newCfg.History[len(newCfg.History)-s.maxHistory:]
+		if len(newCfg.History) > s.maxHistory-1 {
+			newCfg.History = newCfg.History[len(newCfg.History)-(s.maxHistory-1):]
 		}
 	} else {
-		newCfg.History = []models.ConfigVersion{
-			{
-				Version:   newVersion,
-				Value:     value,
-				UpdatedAt: now,
-				UpdatedBy: updatedBy,
-			},
-		}
+		newCfg.History = []models.ConfigVersion{}
 		newCfg.Metadata = &models.Metadata{
 			Owner: updatedBy,
 		}
@@ -344,8 +345,8 @@ func (s *Store) Rollback(tenantID, keyPath string, toVersion int64, updatedBy st
 		}),
 	}
 
-	if len(newCfg.History) > s.maxHistory {
-		newCfg.History = newCfg.History[len(newCfg.History)-s.maxHistory:]
+	if len(newCfg.History) > s.maxHistory-1 {
+		newCfg.History = newCfg.History[len(newCfg.History)-(s.maxHistory-1):]
 	}
 
 	s.configs[tenantID][keyPath] = newCfg
@@ -448,18 +449,11 @@ func (s *Store) PutConfigLocked(tenantID, keyPath string, value json.RawMessage,
 			UpdatedAt: cfg.UpdatedAt,
 			UpdatedBy: cfg.UpdatedBy,
 		})
-		if len(newCfg.History) > s.maxHistory {
-			newCfg.History = newCfg.History[len(newCfg.History)-s.maxHistory:]
+		if len(newCfg.History) > s.maxHistory-1 {
+			newCfg.History = newCfg.History[len(newCfg.History)-(s.maxHistory-1):]
 		}
 	} else {
-		newCfg.History = []models.ConfigVersion{
-			{
-				Version:   newVersion,
-				Value:     value,
-				UpdatedAt: now,
-				UpdatedBy: updatedBy,
-			},
-		}
+		newCfg.History = []models.ConfigVersion{}
 		newCfg.Metadata = &models.Metadata{
 			Owner: updatedBy,
 		}
@@ -756,6 +750,11 @@ func (s *Store) removeLongPollChan(key string, ch chan *models.ConfigKey) {
 }
 
 func CompilePattern(pattern string) *regexp.Regexp {
-	regexPattern := "^" + strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(pattern, ".", "\\."), "**", ".*"), "*", "[^.]*") + "$"
+	const doubleStarPlaceholder = "\x00DS\x00"
+	step1 := strings.ReplaceAll(pattern, "**", doubleStarPlaceholder)
+	step2 := strings.ReplaceAll(step1, ".", "\\.")
+	step3 := strings.ReplaceAll(step2, "*", "[^.]*")
+	step4 := strings.ReplaceAll(step3, doubleStarPlaceholder, ".*")
+	regexPattern := "^" + step4 + "$"
 	return regexp.MustCompile(regexPattern)
 }

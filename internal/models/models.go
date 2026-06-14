@@ -61,7 +61,7 @@ func (r *GrayRules) Match(grayUserID string) bool {
 	}
 	if r.UserIDMod != nil && grayUserID != "" {
 		var userIDNum int64
-		if _, err := json.Unmarshal([]byte(grayUserID), &userIDNum); err != nil {
+		if err := json.Unmarshal([]byte(grayUserID), &userIDNum); err != nil {
 			for _, c := range grayUserID {
 				userIDNum += int64(c)
 			}
@@ -188,10 +188,10 @@ type BatchChange struct {
 }
 
 type ExportData struct {
-	Version  int64            `json:"export_version"`
-	ExportedAt string         `json:"exported_at"`
-	Configs  []ConfigKey      `json:"configs"`
-	Subscriptions []Subscription `json:"subscriptions,omitempty"`
+	Version       int64             `json:"export_version"`
+	ExportedAt    string            `json:"exported_at"`
+	Configs       []*ConfigKey      `json:"configs"`
+	Subscriptions []*Subscription   `json:"subscriptions,omitempty"`
 }
 
 type ImportRequest struct {
